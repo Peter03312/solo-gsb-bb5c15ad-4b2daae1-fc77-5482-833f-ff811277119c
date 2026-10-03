@@ -49,6 +49,20 @@
 既有占用时长不随管制变化**；潮位复核仍按原快照占用，仅在发生改期时以当前管制求解。
 旧接口路径与字段完全不变。
 
+**本轮新增通行费费率版本、账单与冲销单**：财务按航段提交整组**半开分钟费率
+区间（起点非负、终点大于起点、费率为非负整数分/分钟）**
+（`PUT /api/segments/{seg_id}/toll-rates`），**整组替换该段旧费率并继承其他
+航段**，形成全局不可变费率版本（版本号自增）；组内交叠或未知航段**整次拒绝**，
+**未覆盖分钟费率为 0**。港口对已确认行程开单（`POST /api/trips/{id}/bill`，
+输入行程号）：同一事务按**当时最新费率版本**与**确认快照中各段进入分钟**选
+费率，以**固化航时**计费，输出版本号、逐段金额与整数分总额；**旧账单不随
+费率改变**。每个行程只开一次，**重试返回原账单**（200、`replayed=true`）；
+未知行程 `404 TRIP_NOT_FOUND`，**已作废且未开单**的行程拒绝开单
+（`409 TRIP_ALREADY_VOIDED`）。**作废已开单行程时在原作废事务内生成等额
+冲销单**（逐段金额与总额取账单相反数、版本沿用账单版本），重复作废不重复
+冲销，账单与冲销单均可查。开单/作废并发不遗漏或重复冲销，且不改已确认快照、
+批次幂等结果或规划占用；**原作废接口的请求、响应和状态码保持不变**。
+
 **本轮新增误确认行程作废**：调度员误确认后，可凭**行程号 + 非空作废原因**
 将该行程作废（`POST /api/trips/{trip_id}/void`），返回行程号、原因与作废时间；
 作废记录可按行程号查询（`GET /api/trips/{trip_id}/void`，未知行程
@@ -340,6 +354,63 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
     `POST /api/trips/{id}/review` 时，原航路潮位安全复核仍读取其**原确认
     快照**的航段顺序与占用分钟（与作废无关）；只有在需要改期时，建议
     才按当时**仍有效**的其他快照（及当前管制/组关系）求解。
+- **通行费费率版本**：财务按航段提交整组**半开分钟费率区间
+  `[start_minute, end_minute)` 与非负整数费率（分/分钟）**，每次成功提交
+  生成一个**全局不可变费率版本**（版本号自增）：
+  - **整组替换 + 全局继承**（`PUT /api/segments/{seg_id}/toll-rates`）：
+    新版本继承前一版本的**全部航段**费率区间，仅把被提交航段的区间整组
+    替换为本次内容；`rates: []` 表示该航段此后**未覆盖分钟费率为 0**。
+    第一个版本无需基线（其他航段即隐式为 0）。版本一经生成永不修改。
+  - **区间校验**：起点非负、终点大于起点、费率为非负整数（允许 0，免费
+    时段）-> 非法 `422 INVALID_TOLL_RATE_INTERVAL`；组内半开区间交叠
+    （`next.start < prev.end`；首尾相接合法）->
+    `422 OVERLAPPING_TOLL_RATE_INTERVAL`；未知航段
+    `404 SEGMENT_NOT_FOUND`。任一失败**整次拒绝、不生成新版本**，旧版本
+    原样保留。
+  - **未覆盖分钟费率为 0**：开单时某段进入分钟未命中该航段任何费率区间
+    （或该航段在该版本无任何区间），费率取 0，不报错。
+  - **版本查询**：`GET /api/toll/rate-versions`（全部版本，各含其全部航段
+    费率区间）、`GET /api/toll/rate-versions/{version}`（未知版本
+    `404 TOLL_RATE_VERSION_NOT_FOUND`）。
+- **通行费账单**：港口对**已确认行程**出具通行费账单，输入只有行程号
+  （`POST /api/trips/{trip_id}/bill`，无请求体）。
+  - **同一事务固化**：在单个 `BEGIN IMMEDIATE` 事务内取**当时最新费率
+    版本**，读取**确认快照** `itinerary`，每段按其**进入分钟**
+    （快照的 `start_minute`，与分时航时管制同一"进入分钟选定"口径；途中
+    跨区间边界不重选）在该版本中选费率；段金额 = 快照**固化航时**
+    `travel_time` × 费率，账单总额 = 各段金额之和（**整数分**）。账单
+    固化版本号、逐段金额与总额；**旧账单不随之后的新费率版本改变**。
+  - **每行程只开一次**：首次开单 `201`、`replayed:false`；对同一行程重试
+    返回**原账单** `200`、`replayed:true`（版本/金额/开单时间均为首次值，
+    即使其间费率已更新）。未知行程 `404 TRIP_NOT_FOUND`；**已作废且未
+    开单**的行程拒绝开单 `409 TRIP_ALREADY_VOIDED`；系统中尚无任何费率
+    版本时 `409 TOLL_RATE_VERSION_NOT_FOUND`。零航段行程可开单，总额 0。
+  - **账单查询**：`GET /api/trips/{id}/bill`（未开单 `404 BILL_NOT_FOUND`）、
+    `GET /api/toll/bills`（全部账单，按行程号）；账单视图附可空字段
+    `reversal`（见下），账单本身永不被作废流程改写。
+  - **开单不影响既有数据**：开单与费率替换都不写 `confirmed_trips`、不改
+    批次幂等结果、不改变规划占用口径。
+- **作废与等额冲销**：作废**已开单**行程时，在**原作废事务内**
+  （`POST /api/trips/{id}/void` 的同一 `BEGIN IMMEDIATE`）生成一张等额
+  冲销单：
+  - **等额**：冲销单逐段金额与总额取账单原值的**相反数**（账单非负、冲销
+    非正，绝对值完全相等），费率**版本沿用账单固化版本**；未开单行程的
+    作废不产生冲销单。**重复作废不重复冲销**（重复作废本就返回首次作废
+    记录）。
+  - **可查**：`GET /api/trips/{id}/reversal` 返回
+    `{trip_id, version, total_cents(≤0), segments(金额取反), reversed_at}`；
+    未知行程 `404 TRIP_NOT_FOUND`、未开单 `404 BILL_NOT_FOUND`、已开单但
+    未作废 `404 REVERSAL_NOT_FOUND`。账单详情与账单列表内嵌的 `reversal`
+    字段同样可读到冲销单。
+  - **原作废接口不变**：作废请求体、响应字段
+    （`{trip_id, reason, voided_at, replayed}`）与状态码（首次 `201`、
+    重复 `200`、未知行程 `404`、空原因 `422`）完全保持原样；冲销单只在
+    同事务内额外落库，通过账单/冲销查询接口获取。
+  - **并发安全**：开单与作废都持有写锁、由 SQLite 串行化：作废先提交则
+    后到的开单读到作废标识而 `TRIP_ALREADY_VOIDED`（无账单、无冲销）；
+    开单先提交则后到的作废在**同一事务**内读到账单并原子写入冲销（有账单、
+    必有冲销）。唯一约束（`toll_bills.trip_id`、
+    `toll_reversals.bill_trip_id`）兜底并发竞争，**不遗漏也不重复冲销**。
 - **船舶档案**：调度员按**唯一船号**管理档案，每份档案记录**非负吃水、
   水面以上高度、安全余量及启停状态**。
   - **建档**（`POST /api/ships`）：初始版本 1；重复船号
@@ -411,12 +482,46 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 确认时档案版本已变更 | 409 | `SHIP_VERSION_STALE`（`provided_version/current_version`，批次附 `ship_index`） |
 | 查询的档案历史版本不存在 | 404 | `SHIP_VERSION_NOT_FOUND` |
 | 船号与三项参数混用 / 两者皆缺 / 缺 `ship_version` / 非法档案参数 | 422 | `VALIDATION_ERROR` |
+| 费率区间非法（`start<0` / `end<=start` / 费率为负） | 422 | `INVALID_TOLL_RATE_INTERVAL`（整次拒绝、不生成新版本） |
+| 费率区间组内半开交叠 | 422 | `OVERLAPPING_TOLL_RATE_INTERVAL`（整次拒绝、不生成新版本） |
+| 查询的费率版本不存在 | 404 | `TOLL_RATE_VERSION_NOT_FOUND` |
+| 开单时系统中尚无任何费率版本 | 409 | `TOLL_RATE_VERSION_NOT_FOUND` |
+| 对已作废且未开单的行程开单 | 409 | `TRIP_ALREADY_VOIDED`（不出账单、不出冲销） |
+| 查询账单时行程尚未开单 | 404 | `BILL_NOT_FOUND` |
+| 查询冲销单时已开单但行程未作废（无冲销） | 404 | `REVERSAL_NOT_FOUND` |
 
 ---
 
 ## 3. HTTP API
 
-> **本轮用法（船舶档案）**：新增档案管理端点，规划/确认/批次可用船号代替
+> **本轮用法（通行费费率版本、账单与冲销单）**：新增 6 个端点；旧 API
+> 路径与请求/响应完全兼容（作废接口的请求、响应与状态码保持不变，仅在
+> 作废已开单行程时于同事务额外落库冲销单）——
+> - `PUT /api/segments/{seg_id}/toll-rates`：财务按航段提交整组半开分钟
+>   费率区间（起点非负、终点大于起点、费率非负整数分/分钟），整组替换该段
+>   旧费率并**继承其他航段**，生成全局不可变新版本（`201`，回传新版本
+>   全部航段费率）；空组 `rates: []` 表示该段未覆盖分钟费率 0；未知航段
+>   `404 SEGMENT_NOT_FOUND`、非法区间 `422 INVALID_TOLL_RATE_INTERVAL`、
+>   组内交叠 `422 OVERLAPPING_TOLL_RATE_INTERVAL`，任一失败整次拒绝；
+> - `GET /api/toll/rate-versions` / `GET /api/toll/rate-versions/{v}`：
+>   全部版本 / 指定版本（各版本含其全部航段费率；未知版本
+>   `404 TOLL_RATE_VERSION_NOT_FOUND`）；
+> - `POST /api/trips/{trip_id}/bill`：输入行程号（无请求体），同一事务按
+>   **当时最新费率版本**与确认快照各段**进入分钟**选费率、按固化航时计费，
+>   输出版本号、逐段金额与整数分总额；首次 `201`，重试返回原账单 `200`
+>   `replayed:true`；未知行程 `404 TRIP_NOT_FOUND`、已作废且未开单
+>   `409 TRIP_ALREADY_VOIDED`、尚无费率版本
+>   `409 TOLL_RATE_VERSION_NOT_FOUND`；旧账单不随新费率改变；
+> - `GET /api/trips/{trip_id}/bill` / `GET /api/toll/bills`：账单详情 /
+>   全部账单（未开单 `404 BILL_NOT_FOUND`；账单内嵌可空 `reversal`）；
+> - `GET /api/trips/{trip_id}/reversal`：等额冲销单（总额与逐段金额为账单
+>   相反数、版本沿用账单版本）；未开单 `404 BILL_NOT_FOUND`、已开单未作废
+>   `404 REVERSAL_NOT_FOUND`；
+> - 作废**已开单**行程时，冲销单在**原作废事务内**生成（不遗漏、不重复），
+>   作废请求/响应/状态码不变；开单、费率替换与冲销都不改确认快照、批次
+>   幂等结果或规划占用。
+>
+> **上一轮用法（船舶档案）**：新增档案管理端点，规划/确认/批次可用船号代替
 > 三项参数；旧 API 路径与请求/响应结构完全兼容（`PlanResponse`/`TripOut`
 > 等仅新增可空字段 `ship_no`/`ship_version`）——
 > - `POST /api/ships`：建档（唯一船号 + 非负吃水/水面以上高度/安全余量 +
@@ -509,6 +614,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/segments` | 航段列表（按编号排序） |
 | PUT | `/api/segments/{seg_id}/travel-controls` | 以航段编号整组替换分时航时管制（半开区间 + 通行分钟，空组恢复基础航时），返回生效清单 |
 | GET | `/api/segments/{seg_id}/travel-controls` | 查询航段当前生效的分时管制清单（含基础航时） |
+| PUT | `/api/segments/{seg_id}/toll-rates` | **本轮新增**：财务按航段整组提交半开分钟费率区间（非负整数分/分钟），整组替换该段并继承其他航段，生成全局不可变新版本（201，回传新版本全部航段费率）；空组表示该段未覆盖分钟费率为 0 |
+| GET | `/api/toll/rate-versions` | **本轮新增**：全部通行费费率版本（各含其全部航段费率区间） |
+| GET | `/api/toll/rate-versions/{version}` | **本轮新增**：指定费率版本（不可变；未知版本 `TOLL_RATE_VERSION_NOT_FOUND`） |
 | POST | `/api/channel-groups` | **本轮新增**：提交航段编号集合（≥2）登记狭窄水道组，返回组号及按提交次序的成员；建成不可变、不可重复归组 |
 | GET | `/api/channel-groups` | **本轮新增**：狭窄水道组列表（按组号升序） |
 | GET | `/api/channel-groups/{group_id}` | **本轮新增**：狭窄水道组详情（组号、备注、成员航段信息） |
@@ -527,8 +635,12 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/trips/batch/plan` | **本轮新增**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船拟占用） |
 | POST | `/api/trips/batch/confirm` | **本轮新增**：携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放） |
 | POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期 |
-| POST | `/api/trips/{trip_id}/void` | **本轮新增**：凭非空原因作废误确认行程（重复作废 200 返回首次记录） |
-| GET | `/api/trips/{trip_id}/void` | **本轮新增**：按行程号查询作废记录（未作废 `VOID_RECORD_NOT_FOUND`） |
+| POST | `/api/trips/{trip_id}/void` | 凭非空原因作废误确认行程（重复作废 200 返回首次记录）；作废已开单行程时同事务生成等额冲销单（接口请求/响应/状态码不变） |
+| GET | `/api/trips/{trip_id}/void` | 按行程号查询作废记录（未作废 `VOID_RECORD_NOT_FOUND`） |
+| POST | `/api/trips/{trip_id}/bill` | **本轮新增**：为已确认行程开具通行费账单（按当时最新版本 + 快照进入分钟固化；重试 200 返回原账单；已作废未开单 `TRIP_ALREADY_VOIDED`） |
+| GET | `/api/trips/{trip_id}/bill` | **本轮新增**：查询账单（含冲销单；未开单 `BILL_NOT_FOUND`） |
+| GET | `/api/trips/{trip_id}/reversal` | **本轮新增**：查询等额冲销单（未开单 `BILL_NOT_FOUND`、未作废 `REVERSAL_NOT_FOUND`） |
+| GET | `/api/toll/bills` | **本轮新增**：全部通行费账单（按行程号，各附冲销单若已生成） |
 | GET | `/api/trips` | 已确认行程列表（含已作废历史快照，`voided_at` 标识是否已作废） |
 | GET | `/api/trips/{trip_id}` | 已确认行程快照详情 |
 | GET | `/health` | 健康检查 |
@@ -704,6 +816,123 @@ POST /api/trips/7/void
   占用立即对后续规划/确认/改期失效（狭窄水道组的整组展开同步失效）。
 - 作废原因为空串或纯空白 -> `422 VALIDATION_ERROR`（首尾空白会被剥离，
   `"  原因  "` 以 `原因` 入库）。
+
+### 通行费费率版本 / 账单 / 冲销单请求与响应示例（本轮新增）
+
+**① 财务提交费率、生成全局不可变版本**：按航段编号整组提交半开分钟区间，
+费率为非负整数分/分钟；新版本继承其他航段，仅整组替换被提交航段：
+
+```json
+PUT /api/segments/2/toll-rates
+{
+  "rates": [
+    {"start_minute": 0,   "end_minute": 360,  "rate_cents_per_minute": 5},
+    {"start_minute": 360, "end_minute": 1080, "rate_cents_per_minute": 8}
+  ],
+  "note": "B->C 日间费率调整"
+}
+```
+
+```json
+// 201 —— 返回新版本（此处为 #2）及其全部航段费率（seg1 继承自 #1，seg2 本次替换）
+{
+  "version": 2,
+  "changed_seg_id": 2,
+  "note": "B->C 日间费率调整",
+  "created_at": "2026-10-03 10:00:00",
+  "rates": [
+    {"seg_id": 1, "start_minute": 0,    "end_minute": 360,  "rate_cents_per_minute": 2},
+    {"seg_id": 1, "start_minute": 360,  "end_minute": 720,  "rate_cents_per_minute": 1},
+    {"seg_id": 1, "start_minute": 720,  "end_minute": 1440, "rate_cents_per_minute": 2},
+    {"seg_id": 2, "start_minute": 0,    "end_minute": 360,  "rate_cents_per_minute": 5},
+    {"seg_id": 2, "start_minute": 360,  "end_minute": 1080, "rate_cents_per_minute": 8}
+  ]
+}
+```
+
+- 非法区间（`start<0`、`end<=start`、费率为负）->
+  `422 INVALID_TOLL_RATE_INTERVAL`；组内交叠 ->
+  `422 OVERLAPPING_TOLL_RATE_INTERVAL`；未知航段 ->
+  `404 SEGMENT_NOT_FOUND`。任一失败**整次拒绝、不生成新版本**（版本号不跳号）。
+- 空组 `{"rates": []}` 合法：该航段在此新版本中未覆盖分钟费率为 0。
+- 查询：`GET /api/toll/rate-versions`（全量）、
+  `GET /api/toll/rate-versions/2`（指定版本）。
+
+**② 开单**：输入只有行程号，事务内按当时最新版本与确认快照各段进入分钟
+固化（段金额 = 固化航时 × 进入分钟费率；未覆盖分钟费率 0）：
+
+```
+POST /api/trips/7/bill        # 无请求体
+```
+
+```json
+// 201 首次开单（重试同一行程返回 200 且 replayed=true、内容为原账单）
+{
+  "trip_id": 7,
+  "version": 2,
+  "total_cents": 360,
+  "segments": [
+    {"leg_index": 0, "seg_id": 1, "origin": "A", "destination": "B",
+     "entry_minute": 0,  "travel_time": 30,
+     "rate_cents_per_minute": 2, "amount_cents": 60},
+    {"leg_index": 1, "seg_id": 2, "origin": "B", "destination": "C",
+     "entry_minute": 30, "travel_time": 40,
+     "rate_cents_per_minute": 5, "amount_cents": 200},
+    {"leg_index": 2, "seg_id": 3, "origin": "C", "destination": "D",
+     "entry_minute": 70, "travel_time": 20,
+     "rate_cents_per_minute": 0, "amount_cents": 0}
+  ],
+  "billed_at": "2026-10-03 10:01:00",
+  "reversal": null,
+  "replayed": false
+}
+```
+
+- 第 2 段在分钟 30 进入，命中 `[0,360)` 的费率 5；途中跨过 360 边界**不重选**。
+- 第 3 段在版本 #2 无费率区间 -> 费率 0、金额 0。
+- 之后费率再出新版，`POST /api/trips/7/bill` 重试与 `GET` 查询都仍是
+  version 2、360 分（**旧账单不随费率改变**）。
+- 未知行程 `404 TRIP_NOT_FOUND`；已作废且未开单
+  `409 TRIP_ALREADY_VOIDED`；尚无费率版本
+  `409 TOLL_RATE_VERSION_NOT_FOUND`。
+
+**③ 作废已开单行程 -> 同事务等额冲销**：作废接口的请求/响应/状态码不变；
+冲销单另走查询接口：
+
+```json
+POST /api/trips/7/void
+{ "reason": "调度员误确认：撤销" }
+// 201（与以往完全一致）
+{ "trip_id": 7, "reason": "调度员误确认：撤销",
+  "voided_at": "2026-10-03 10:05:00", "replayed": false }
+```
+
+```json
+GET /api/trips/7/reversal
+// 200 —— 等额冲销：逐段金额与总额取账单相反数，版本沿用账单版本
+{
+  "trip_id": 7,
+  "version": 2,
+  "total_cents": -360,
+  "segments": [
+    {"leg_index": 0, "seg_id": 1, "origin": "A", "destination": "B",
+     "entry_minute": 0,  "travel_time": 30,
+     "rate_cents_per_minute": 2, "amount_cents": -60},
+    {"leg_index": 1, "seg_id": 2, "origin": "B", "destination": "C",
+     "entry_minute": 30, "travel_time": 40,
+     "rate_cents_per_minute": 5, "amount_cents": -200},
+    {"leg_index": 2, "seg_id": 3, "origin": "C", "destination": "D",
+     "entry_minute": 70, "travel_time": 20,
+     "rate_cents_per_minute": 0, "amount_cents": 0}
+  ],
+  "reversed_at": "2026-10-03 10:05:00"
+}
+```
+
+- 账单仍可查（`GET /api/trips/7/bill`、`GET /api/toll/bills`），其
+  `reversal` 字段内嵌上述冲销单；未开单行程作废不产生冲销（冲销查询
+  `404 BILL_NOT_FOUND`）；已开单未作废查冲销 `404 REVERSAL_NOT_FOUND`。
+- 重复作废仍返回首次作废记录（200 `replayed:true`），**不重复冲销**。
 
 ### 船舶档案与船号规划请求 / 响应示例（本轮新增）
 
@@ -1027,7 +1256,48 @@ curl -s $BASE/health
 # 查看演示航段
 curl -s $BASE/api/segments
 
+# 0a) 本轮新增：通行费费率版本（财务按航段整组提交；继承其他航段、全局不可变）
+#     为航段 2 提交费率：[0,360) 5 分/分钟、[360,1080) 8 分/分钟
+curl -s -X PUT $BASE/api/segments/2/toll-rates \
+  -H 'Content-Type: application/json' \
+  -d '{"rates":[{"start_minute":0,"end_minute":360,"rate_cents_per_minute":5},
+                {"start_minute":360,"end_minute":1080,"rate_cents_per_minute":8}],
+       "note":"B->C 日间费率"}'
+# 201 {"version":2,"changed_seg_id":2,...,"rates":[...seg1 继承自 v1, seg2 本次替换...]}
+# 非法区间 / 组内交叠分别返回
+# 422 INVALID_TOLL_RATE_INTERVAL / 422 OVERLAPPING_TOLL_RATE_INTERVAL
+# 未知航段 404 SEGMENT_NOT_FOUND；任一失败整次拒绝、不生成新版本
+curl -s -i -X PUT $BASE/api/segments/2/toll-rates -H 'Content-Type: application/json' \
+  -d '{"rates":[{"start_minute":0,"end_minute":10,"rate_cents_per_minute":-1}]}' | head -1
+# 查询版本（演示库启动即带版本 #1；未覆盖分钟费率为 0）
+curl -s $BASE/api/toll/rate-versions
+curl -s $BASE/api/toll/rate-versions/2
+
+# 0b) 本轮新增：对已确认行程开单（输入只有行程号；同一事务按当时最新版本 +
+#     确认快照各段进入分钟固化，旧账单不随新费率改变）
+TID=1   # 用确认接口返回的行程号替换
+curl -s -i -X POST $BASE/api/trips/$TID/bill            # 首次 201
+# 201 {"trip_id":1,"version":2,"total_cents":...,"segments":[
+#       {"leg_index":0,"seg_id":1,"entry_minute":0,"travel_time":30,
+#        "rate_cents_per_minute":2,"amount_cents":60}, ...],
+#      "billed_at":"...","reversal":null,"replayed":false}
+curl -s -i -X POST $BASE/api/trips/$TID/bill | head -1  # 重试 200、replayed=true
+# 未知行程 404 TRIP_NOT_FOUND；已作废且未开单 409 TRIP_ALREADY_VOIDED；
+# 尚无费率版本 409 TOLL_RATE_VERSION_NOT_FOUND
+curl -s $BASE/api/trips/$TID/bill                       # 查询账单（含冲销单）
+curl -s $BASE/api/toll/bills                            # 全部账单
+
+# 0c) 本轮新增：作废已开单行程（作废请求/响应/状态码不变；同事务生成等额冲销）
+curl -s -X POST $BASE/api/trips/$TID/void \
+  -H 'Content-Type: application/json' -d '{"reason":"误确认撤销"}'
+# 201 {"trip_id":1,"reason":"误确认撤销","voided_at":"...","replayed":false}
+curl -s $BASE/api/trips/$TID/reversal
+# 200 {"trip_id":1,"version":2,"total_cents":-...,"segments":[...金额取反...],
+#      "reversed_at":"..."}   （未开单 404 BILL_NOT_FOUND；未作废 404 REVERSAL_NOT_FOUND）
+# 重复作废仍 200 replayed=true，不重复冲销
+
 # 0) 本轮新增：误确认后作废行程（行程号 + 非空原因；重复作废返回首次记录）
+#    （若该行程已开单，作废会在同一事务内生成等额冲销单；作废响应本身不变）
 curl -s -X POST $BASE/api/trips/$TID/void \
   -H 'Content-Type: application/json' \
   -d '{"reason":"调度员误确认：船舶未离泊，撤销占用"}'
@@ -1518,6 +1788,42 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 5. **复核按历史快照**：`review_and_reschedule` 直接读 `confirmed_trips`
    行做原航路潮位检查，与是否作废无关；仅改期 DP 的 blocked 来自
    `load_occupancy(exclude_trip_id=…)`，天然只含仍有效的其他快照。
+6. **冲销在作废事务内生成**：首次作废插入 `voided_trips` 后，同一事务调用
+   `toll.create_reversal_in_void`——已开单则写入 `toll_reversals`
+   （逐段金额与总额取账单相反数、版本沿用账单版本），未开单为空操作；
+   重复作废在第 2 步的重放分支提前返回，绝不重复冲销。作废 HTTP 响应
+   不含冲销信息（请求/响应/状态码保持原样），冲销单另走
+   `GET /api/trips/{id}/reversal` 与账单内嵌 `reversal` 查询。
+
+### 通行费费率版本 / 账单 / 冲销单（实现见 `app/services/toll.py`）
+
+1. 建表三张：`toll_rate_versions(version PK, changed_seg_id, note,
+   created_at)`、`toll_rates(version, seg_id, start_minute, end_minute,
+   rate_cents_per_minute)`（每版本**全量物化**全部航段区间，版本不可变、
+   独立可查）、`toll_bills(trip_id PK, version, total_cents, segments JSON,
+   billed_at)`，以及 `toll_reversals(bill_trip_id PK, version, total_cents≤0,
+   segments JSON, reversed_at)`。两张主键唯一约束从数据库层兜底重复开单与
+   重复冲销；旧库启动随 `SCHEMA` 幂等建表，无需手工迁移。
+2. **费率替换**（`replace_segment_rates`，单事务）：先在事务外完成未知航段
+   与区间校验（非法 `INVALID_TOLL_RATE_INTERVAL`、交叠
+   `OVERLAPPING_TOLL_RATE_INTERVAL`，失败不出版本）；事务内插入版本行，
+   从上一版本 `INSERT … SELECT` 复制全部航段区间，再删除并重建该航段区间
+   （空组即只删不插）。空库第一次提交即版本 1，其他航段隐式为 0。
+3. **开单**（`issue_bill`，单事务 `BEGIN IMMEDIATE`）：行程未知
+   `TRIP_NOT_FOUND`；已有账单直接重放首次值（`replayed=true`）；已作废
+   且未开单 `TRIP_ALREADY_VOIDED`；无费率版本
+   `TOLL_RATE_VERSION_NOT_FOUND`。通过后取 `MAX(version)` 为当时最新版本，
+   逐段以快照 `start_minute`（进入分钟）在该版本区间中选费率
+   （`rate_at`，未覆盖返回 0），金额 = 快照固化 `travel_time` × 费率，
+   逐段 JSON 与整数分总额一次落库。新费率版本不触碰历史账单行。
+4. **冲销**（`create_reversal_in_void`）：由 `void_trip` 在其**已持有的
+   作废事务**内调用，账单不存在为空操作；存在则插入逐段金额取反、总额为
+   账单相反数的冲销行。因开单与作废都在 `BEGIN IMMEDIATE` 下串行：
+   开单先提交 -> 作废同事务必读到账单并写冲销；作废先提交 -> 开单读到
+   作废标识而拒绝。任何顺序下「有账单且已作废 ⇒ 恰有一张等额冲销」。
+5. **演示数据**：`SEED_DEMO=true` 的空库初始化时附带费率版本 #1（seg1
+   A->B 的 `[0,360)` 2 分、`[360,720)` 1 分、`[720,1440)` 2 分/分钟），
+   启动即可体验开单全流程；其余航段未覆盖分钟费率 0。
 
 ### 船舶档案（实现见 `app/services/ships.py`）
 
@@ -1611,7 +1917,8 @@ app/
   services/planning.py  # 潮汐约束与时间展开 DP 规划算法（航时按进入分钟管制选定；load_occupancy 展开组占用）
   services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键；批内拟占用同步展开组占用）
   services/reschedule.py# 更正后原行程复核与改期 DP（复核只判潮位；改期避开他人组占用且排除自身、按当前管制，只读）
-  services/voids.py     # 误确认作废：事务内作废（重复作废返回首次记录）、作废记录查询
+  services/voids.py     # 误确认作废：事务内作废（重复作废返回首次记录）、作废记录查询；已开单则同事务生成等额冲销
+  services/toll.py      # 通行费：费率版本（整组替换+继承，不可变）、开单（按当时最新版本与快照进入分钟固化）、冲销/查询
   services/ships.py     # 船舶档案：建档/版本化变更（单事务）、当前与历史版本查询、规划/确认用档案解析
   main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/船舶档案/潮位更正与误差修订/单船与批次规划确认/复核改期/作废）
 tests/                  # pytest 测试（165 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行、船舶档案与船号规划确认等）

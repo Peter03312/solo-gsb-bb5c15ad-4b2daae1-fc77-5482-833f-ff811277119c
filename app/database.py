@@ -119,6 +119,54 @@ CREATE TABLE IF NOT EXISTS channel_group_members (
     position   INTEGER NOT NULL,                                    -- 提交集合中的次序（0 起）
     PRIMARY KEY (group_id, seg_id)
 );
+
+-- 通行费费率版本：财务按航段整组提交半开分钟费率区间，每次提交生成一个
+-- 全局不可变新版本（版本号自增）。新版本继承前一版本的全部航段区间，
+-- 仅整组替换被提交航段（changed_seg_id）的区间；空组表示该航段此后未覆盖
+-- 分钟费率为 0。版本一经生成永不修改，账单按其版本号永久固化。
+CREATE TABLE IF NOT EXISTS toll_rate_versions (
+    version         INTEGER PRIMARY KEY AUTOINCREMENT,
+    changed_seg_id  INTEGER NOT NULL REFERENCES segments(seg_id),  -- 本次替换费率的航段
+    note            TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 各费率版本下的全局费率区间快照（全量物化：生成新版本时从上一版本复制
+-- 全部既有航段区间，再删除/重写 changed_seg_id 的部分）。费率为非负整数
+-- 分/分钟；同版本同航段的半开区间互不交叠（服务层保证），未覆盖分钟费率 0。
+CREATE TABLE IF NOT EXISTS toll_rates (
+    version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),
+    seg_id        INTEGER NOT NULL REFERENCES segments(seg_id),
+    start_minute  INTEGER NOT NULL CHECK (start_minute >= 0),
+    end_minute    INTEGER NOT NULL CHECK (end_minute > start_minute),  -- 半开区间止（不含）
+    rate_cents_per_minute INTEGER NOT NULL CHECK (rate_cents_per_minute >= 0),  -- 非负整数分/分钟
+    PRIMARY KEY (version, seg_id, start_minute)
+);
+
+-- 通行费账单：每个已确认行程至多一张（trip_id 唯一）。账单在单个
+-- BEGIN IMMEDIATE 事务内按当时最新费率版本与确认快照各段进入分钟固化，
+-- 之后费率版本再如何变化都不改写旧账单。segments 为逐段计费结果 JSON：
+-- 金额 = 该段固化航时 travel_time × 进入分钟(start_minute)命中区间费率，
+-- 未覆盖分钟费率 0；total_cents 为各段金额之和（非负整数分）。
+CREATE TABLE IF NOT EXISTS toll_bills (
+    trip_id       INTEGER PRIMARY KEY REFERENCES confirmed_trips(trip_id),
+    version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),  -- 开单时固化的费率版本
+    total_cents   INTEGER NOT NULL CHECK (total_cents >= 0),
+    segments      TEXT NOT NULL,                                           -- 逐段计费结果 JSON
+    billed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 冲销单：作废已开单行程时在原作废事务内生成，每个账单至多一张
+-- （bill_trip_id 唯一兜底并发）。等额冲销——逐段金额与总额取账单原值的
+-- 相反数（账单为正、冲销为负，绝对值完全相等），费率版本引用沿用账单
+-- 版本（旧账单不随费率变化，冲销同样固化）。重复作废不重复冲销。
+CREATE TABLE IF NOT EXISTS toll_reversals (
+    bill_trip_id  INTEGER PRIMARY KEY REFERENCES toll_bills(trip_id),
+    version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),
+    total_cents   INTEGER NOT NULL CHECK (total_cents <= 0),               -- 非正整数分（与账单等额相反）
+    segments      TEXT NOT NULL,                                           -- 逐段冲销结果 JSON（金额取反）
+    reversed_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -203,6 +251,18 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
         rows = [(rev, m, 2.0 + 1.5 * math.sin(2 * math.pi * m / 720.0)) for m in range(1440)]
         conn.executemany(
             "INSERT INTO tide_values(revision, minute, level) VALUES (?, ?, ?)", rows
+        )
+
+        # 通行费费率初始版本：A->B(seg 1) 分时段费率；其余航段未覆盖分钟费率为 0。
+        # 财务可随后通过 PUT /api/segments/{seg_id}/toll-rates 整组替换生成新版本。
+        conn.execute(
+            "INSERT INTO toll_rate_versions(changed_seg_id, note)"
+            " VALUES (1, '初始演示费率版本：A->B 航段分时段费率（分/分钟）')"
+        )
+        conn.executemany(
+            "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute,"
+            " rate_cents_per_minute) VALUES (1, 1, ?, ?, ?)",
+            [(0, 360, 2), (360, 720, 1), (720, 1440, 2)],
         )
         conn.execute("COMMIT")
     except Exception:

@@ -9,19 +9,26 @@
   调度**中失效（`planning.load_occupancy` 经 `voided_trips` 过滤）；
 * 作废记录不可变：重复作废**返回首次记录**（同样的原因与作废时间），
   `200 replayed=true`，绝不覆盖原因；
+* 作废**已开单**行程时，在**同一作废事务**内生成一张**等额冲销单**
+  （`services/toll.py`：逐段金额与总额取账单原值的相反数，费率版本沿用
+  账单版本）；未开单行程的作废不生成冲销单。重复作废不重复冲销，账单与
+  冲销单均可查（`GET /api/trips/{id}/bill` / `.../reversal`）；
 * 未知行程 `404 TRIP_NOT_FOUND`（作废与查询口径一致）；
   行程存在但从未作废时查询记录 `404 VOID_RECORD_NOT_FOUND`。
 
-并发：作废与确认都在单个 `BEGIN IMMEDIATE` 事务内完成状态变更与占用复算，
-SQLite 的写锁将二者串行化，因此不会产生相互重叠的有效确认行程——先提交的
-作废会被后进入事务的确认在 `load_occupancy` 时读到（被作废行程不再占位，
-但这不会造成重叠，因为该行程已无效）；先提交的确认同样会被作废看到。
-已作废批次行程的原幂等键重放仍返回首次确认结果，不重新产生占用
-（见 `services/batch.py`，重放优先且完全不读占用表）。
+并发：作废与确认、开单都在单个 `BEGIN IMMEDIATE` 事务内完成状态变更，
+SQLite 的写锁将三者串行化——开单先提交则随后的作废在本事务内读到账单并
+原子写入冲销；作废先提交则随后的开单读到作废标识而以
+`TRIP_ALREADY_VOIDED` 拒绝。唯一约束（`toll_bills.trip_id` 与
+`toll_reversals.bill_trip_id`）兜底竞争，保证不重复开单、不重复冲销。
+作废不改正确认快照、不改正批次幂等结果；已作废批次行程的原幂等键重放仍
+返回首次确认结果，不重新产生占用（见 `services/batch.py`，重放优先且完全
+不读占用表）。
 """
 import sqlite3
 
 from ..errors import ApiError
+from .toll import create_reversal_in_void
 
 
 def _trip_exists(conn, trip_id: int) -> bool:
@@ -58,10 +65,11 @@ def get_void_record(conn, trip_id: int) -> dict:
 def void_trip(conn, trip_id: int, reason: str) -> tuple[dict, bool]:
     """作废已确认行程。返回 (作废记录, replayed)。
 
-    首次作废：`BEGIN IMMEDIATE` 内核验行程存在、插入不可变作废记录，
-    返回 (记录, False)，HTTP 层据此返回 201。
+    首次作废：`BEGIN IMMEDIATE` 内核验行程存在、插入不可变作废记录；若该
+    行程已开单，在**同一事务**内追加等额冲销单；返回 (记录, False)，
+    HTTP 层据此返回 201（响应结构不变，冲销单另走查询接口）。
     重复作废（含并发竞争）：返回**首次**记录与 True（HTTP 200），
-    不覆盖原因、不更新时间。未知行程 -> 404 TRIP_NOT_FOUND。
+    不覆盖原因、不更新时间、不重复冲销。未知行程 -> 404 TRIP_NOT_FOUND。
 
     作废本身不写 confirmed_trips、不改正批次幂等结果；占用失效在
     load_occupancy 读侧即时生效。
@@ -100,6 +108,10 @@ def void_trip(conn, trip_id: int, reason: str) -> tuple[dict, bool]:
             ).fetchone()
             return {"trip_id": row["trip_id"], "reason": row["reason"],
                     "voided_at": row["voided_at"]}, True
+
+        # 首次作废：在同一作废事务内为已开单行程生成等额冲销单（未开单为空操作）。
+        # 重复作废在上方重放分支提前返回，绝不重复冲销。
+        create_reversal_in_void(conn, trip_id)
 
         row = conn.execute(
             "SELECT trip_id, reason, voided_at FROM voided_trips WHERE trip_id = ?",

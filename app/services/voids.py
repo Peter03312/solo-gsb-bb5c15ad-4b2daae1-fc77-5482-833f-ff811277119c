@@ -9,6 +9,8 @@
   调度**中失效（`planning.load_occupancy` 经 `voided_trips` 过滤）；
 * 作废记录不可变：重复作废**返回首次记录**（同样的原因与作废时间），
   `200 replayed=true`，绝不覆盖原因；
+* 作废已开单行程时，在**同一作废事务**内生成等额冲销单
+  （`services/billing.py`，每账单至多一张；重复作废不重复冲销）；
 * 未知行程 `404 TRIP_NOT_FOUND`（作废与查询口径一致）；
   行程存在但从未作废时查询记录 `404 VOID_RECORD_NOT_FOUND`。
 
@@ -22,6 +24,7 @@ SQLite 的写锁将二者串行化，因此不会产生相互重叠的有效确�
 import sqlite3
 
 from ..errors import ApiError
+from .billing import create_reversal_if_billed
 
 
 def _trip_exists(conn, trip_id: int) -> bool:
@@ -100,6 +103,10 @@ def void_trip(conn, trip_id: int, reason: str) -> tuple[dict, bool]:
             ).fetchone()
             return {"trip_id": row["trip_id"], "reason": row["reason"],
                     "voided_at": row["voided_at"]}, True
+
+        # 作废已开单行程：同一作废事务内生成等额冲销单（每账单至多一张，
+        # 重复作废走上面的既有记录分支、不会重复冲销）
+        create_reversal_if_billed(conn, trip_id)
 
         row = conn.execute(
             "SELECT trip_id, reason, voided_at FROM voided_trips WHERE trip_id = ?",

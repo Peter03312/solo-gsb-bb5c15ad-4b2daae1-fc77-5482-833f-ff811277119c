@@ -16,21 +16,29 @@ from .schemas import (
     BatchConfirmResponse,
     BatchPlanRequest,
     BatchPlanResponse,
+    BillIssueResponse,
+    BillOut,
     ChannelGroupCreateRequest,
     ChannelGroupOut,
     ConfirmRequest,
     NodeIn,
     PlanRequest,
     PlanResponse,
+    ReversalOut,
     ReviewRequest,
     RevisionOut,
     SegmentIn,
     SegmentOut,
+    SegmentTollRatesOut,
     ShipCreateRequest,
     ShipOut,
     ShipUpdateRequest,
     ShipUpdateResponse,
     ShipVersionOut,
+    TollRateSubmitRequest,
+    TollRateSubmitResponse,
+    TollRateVersionDetailOut,
+    TollRateVersionOut,
     TravelControlListOut,
     TravelControlOut,
     TravelControlReplaceRequest,
@@ -43,6 +51,17 @@ from .schemas import (
     VoidRecordOut,
 )
 from .services.batch import confirm_batch, plan_batch
+from .services.billing import (
+    current_segment_rates,
+    get_bill,
+    get_reversal,
+    issue_bill,
+    list_bills,
+    list_rate_versions,
+    list_reversals,
+    rate_version_detail,
+    submit_segment_rates,
+)
 from .services.controls import load_controls, replace_segment_controls
 from .services.groups import create_group, get_group, list_groups
 from .services.planning import find_itinerary, load_occupancy
@@ -765,6 +784,124 @@ def get_trip_void_record(trip_id: int):
     """
     with get_conn() as conn:
         return get_void_record(conn, trip_id)
+
+
+# ---- 通行费费率版本与账单 -------------------------------------------------------
+
+@app.put(
+    "/api/segments/{seg_id}/toll-rates",
+    status_code=201,
+    response_model=TollRateSubmitResponse,
+    tags=["toll"],
+)
+def submit_toll_rates(seg_id: int, body: TollRateSubmitRequest):
+    """按航段整组提交半开分钟费率区间，生成新的全局不可变费率版本。
+
+    整组替换该段旧费率并继承上一版本其他航段；空组清除该段费率；未覆盖
+    分钟费率为零。未知航段 404 SEGMENT_NOT_FOUND、非法区间
+    422 INVALID_RATE_INTERVAL、组内交叠 422 OVERLAPPING_RATE_INTERVAL，
+    任一失败整次拒绝、不产生新版本。
+    """
+    with get_conn() as conn:
+        return submit_segment_rates(
+            conn, seg_id, [r.model_dump() for r in body.rates], body.note
+        )
+
+
+@app.get(
+    "/api/segments/{seg_id}/toll-rates",
+    response_model=SegmentTollRatesOut,
+    tags=["toll"],
+)
+def get_segment_toll_rates(seg_id: int):
+    """查询航段在最新费率版本下的生效清单（尚无版本时 version 为 null）。"""
+    with get_conn() as conn:
+        return current_segment_rates(conn, seg_id)
+
+
+@app.get(
+    "/api/toll/rate-versions",
+    response_model=list[TollRateVersionOut],
+    tags=["toll"],
+)
+def list_toll_rate_versions():
+    """费率版本列表（按版本号升序）。"""
+    with get_conn() as conn:
+        return list_rate_versions(conn)
+
+
+@app.get(
+    "/api/toll/rate-versions/{version}",
+    response_model=TollRateVersionDetailOut,
+    tags=["toll"],
+)
+def get_toll_rate_version(version: int):
+    """读取指定费率版本的全量费率表。未知版本 404 RATE_VERSION_NOT_FOUND。"""
+    with get_conn() as conn:
+        return rate_version_detail(conn, version)
+
+
+@app.post(
+    "/api/trips/{trip_id}/bill",
+    response_model=BillIssueResponse,
+    tags=["toll"],
+)
+def bill_trip(trip_id: int):
+    """为已确认行程开具通行费账单（事务内按当时最新费率版本计费）。
+
+    按确认快照各段进入分钟选定费率、以固化航时计费（金额 = 费率 × 航时，
+    整数分），逐段金额与总额随账单固化，旧账单不随费率改变。每个行程只
+    开一次：重试返回原账单（200，replayed=true）。未知行程
+    404 TRIP_NOT_FOUND；已作废且未开单 409 TRIP_VOIDED；尚未发布任何
+    费率版本 404 RATE_VERSION_NOT_FOUND。
+    """
+    with get_conn() as conn:
+        record, replayed = issue_bill(conn, trip_id)
+    if replayed:
+        return JSONResponse(status_code=200,
+                            content={**record, "replayed": True})
+    return JSONResponse(status_code=201,
+                        content={**record, "replayed": False})
+
+
+@app.get(
+    "/api/trips/{trip_id}/bill",
+    response_model=BillOut,
+    tags=["toll"],
+)
+def get_trip_bill(trip_id: int):
+    """按行程号查询账单。未知行程 404 TRIP_NOT_FOUND；未开单 404 BILL_NOT_FOUND。"""
+    with get_conn() as conn:
+        return get_bill(conn, trip_id)
+
+
+@app.get(
+    "/api/trips/{trip_id}/reversal",
+    response_model=ReversalOut,
+    tags=["toll"],
+)
+def get_trip_reversal(trip_id: int):
+    """按行程号查询冲销单（作废已开单行程时在原作废事务内生成）。
+
+    未知行程 404 TRIP_NOT_FOUND；行程存在但无冲销单
+    404 REVERSAL_NOT_FOUND。
+    """
+    with get_conn() as conn:
+        return get_reversal(conn, trip_id)
+
+
+@app.get("/api/bills", response_model=list[BillOut], tags=["toll"])
+def list_toll_bills():
+    """全部通行费账单（按账单号升序）。"""
+    with get_conn() as conn:
+        return list_bills(conn)
+
+
+@app.get("/api/reversals", response_model=list[ReversalOut], tags=["toll"])
+def list_toll_reversals():
+    """全部冲销单（按冲销单号升序）。"""
+    with get_conn() as conn:
+        return list_reversals(conn)
 
 
 @app.post(

@@ -119,6 +119,49 @@ CREATE TABLE IF NOT EXISTS channel_group_members (
     position   INTEGER NOT NULL,                                    -- 提交集合中的次序（0 起）
     PRIMARY KEY (group_id, seg_id)
 );
+
+-- 通行费费率版本：财务按航段提交整组半开分钟费率区间，每次提交生成一个
+-- 全局不可变版本（整组替换该段旧费率、继承上一版本其他航段）。版本只增不改。
+CREATE TABLE IF NOT EXISTS toll_rate_versions (
+    version     INTEGER PRIMARY KEY AUTOINCREMENT,
+    seg_id      INTEGER NOT NULL REFERENCES segments(seg_id),   -- 本次整组替换的航段
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 各版本的全量费率表（上一版本其他航段继承 + 本航段整组替换后的快照）。
+-- 未覆盖分钟费率为零（读侧口径，不存零费率行）；同版本同航段区间互不交叠
+-- 由服务层保证。
+CREATE TABLE IF NOT EXISTS toll_rates (
+    version      INTEGER NOT NULL REFERENCES toll_rate_versions(version),
+    seg_id       INTEGER NOT NULL,
+    start_minute INTEGER NOT NULL CHECK (start_minute >= 0),
+    end_minute   INTEGER NOT NULL CHECK (end_minute > start_minute),  -- 半开区间止（不含）
+    rate         INTEGER NOT NULL CHECK (rate >= 0),                  -- 非负整数分/分钟
+    PRIMARY KEY (version, seg_id, start_minute)
+);
+
+-- 通行费账单：每个已确认行程至多一张（trip_id 唯一，兜底并发重复开单）。
+-- 开单时按当时最新费率版本与确认快照各段进入分钟选定费率、以固化航时计费，
+-- 逐段金额与总额随账单固化——后续费率变更不改写既有账单。
+CREATE TABLE IF NOT EXISTS toll_bills (
+    bill_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id      INTEGER NOT NULL UNIQUE REFERENCES confirmed_trips(trip_id),
+    rate_version INTEGER NOT NULL REFERENCES toll_rate_versions(version),
+    total_amount INTEGER NOT NULL CHECK (total_amount >= 0),  -- 总额（整数分）
+    legs         TEXT NOT NULL,                               -- JSON 逐段金额明细
+    billed_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 冲销单：作废已开单行程时在原作废事务内生成的等额冲销；每张账单至多一张
+-- （bill_id 唯一），重复作废不重复冲销。账单与冲销单均可查。
+CREATE TABLE IF NOT EXISTS toll_reversals (
+    reversal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id     INTEGER NOT NULL UNIQUE REFERENCES toll_bills(bill_id),
+    trip_id     INTEGER NOT NULL REFERENCES confirmed_trips(trip_id),
+    amount      INTEGER NOT NULL CHECK (amount >= 0),   -- 等额冲销（= 被冲账单总额）
+    reversed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -203,6 +246,22 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
         rows = [(rev, m, 2.0 + 1.5 * math.sin(2 * math.pi * m / 720.0)) for m in range(1440)]
         conn.executemany(
             "INSERT INTO tide_values(revision, minute, level) VALUES (?, ?, ?)", rows
+        )
+
+        # 演示通行费费率版本 #1：四条航段全天统一费率（分/分钟）
+        rate_ver = conn.execute(
+            "INSERT INTO toll_rate_versions(seg_id, note) VALUES (?, ?)",
+            (1, "初始通行费费率：全航段全天统一费率"),
+        ).lastrowid
+        conn.executemany(
+            "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute, rate)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [
+                (rate_ver, 1, 0, 1440, 12),
+                (rate_ver, 2, 0, 1440, 20),
+                (rate_ver, 3, 0, 1440, 15),
+                (rate_ver, 4, 0, 1440, 8),
+            ],
         )
         conn.execute("COMMIT")
     except Exception:

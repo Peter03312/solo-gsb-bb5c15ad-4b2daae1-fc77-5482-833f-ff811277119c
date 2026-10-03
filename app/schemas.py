@@ -402,6 +402,97 @@ class TripVoidResponse(VoidRecordOut):
     )
 
 
+# ---- 通行费费率版本 / 账单 -------------------------------------------------------
+
+class TollRateIn(BaseModel):
+    # 合法性（start>=0、end>start、rate 为非负整数）由服务层统一校验并返回
+    # INVALID_RATE_INTERVAL，保证非法区间只有一个拒绝口径
+    start_minute: int = Field(description="费率半开区间起点（含），绝对分钟，>=0")
+    end_minute: int = Field(description="费率半开区间止点（不含），必须 > start_minute")
+    rate: int = Field(description="该区间内进入航段的通行费率（非负整数，分/分钟）")
+
+
+class TollRateSubmitRequest(BaseModel):
+    rates: list[TollRateIn] = Field(
+        description="整组替换该航段费率的半开分钟区间清单（空组清除该段费率）；"
+                    "组内区间不得交叠；提交即生成全局不可变费率版本"
+    )
+    note: Optional[str] = None
+
+
+class TollRateOut(TollRateIn):
+    pass
+
+
+class TollRateVersionOut(BaseModel):
+    version: int = Field(description="全局费率版本号（自增、不可变）")
+    seg_id: int = Field(description="本次整组替换的航段编号")
+    note: Optional[str] = None
+    created_at: str
+
+
+class TollRateSubmitResponse(TollRateVersionOut):
+    rates: list[TollRateOut] = Field(
+        description="该航段在新版本下的生效费率清单（按起点升序）"
+    )
+
+
+class SegmentTollRatesOut(BaseModel):
+    seg_id: int = Field(description="航段编号")
+    version: Optional[int] = Field(
+        description="当前最新费率版本号；尚无任何版本时为 null"
+    )
+    rates: list[TollRateOut] = Field(
+        description="该航段在最新版本下的生效费率清单（按起点升序）；"
+                    "未覆盖分钟费率为零"
+    )
+
+
+class TollRateEntryOut(TollRateIn):
+    seg_id: int = Field(description="费率所属航段编号")
+
+
+class TollRateVersionDetailOut(TollRateVersionOut):
+    rates: list[TollRateEntryOut] = Field(
+        description="该版本的全量费率表（继承上一版本其他航段 + 本次替换后的快照，"
+                    "按航段编号、起点升序）"
+    )
+
+
+class BillLegOut(BaseModel):
+    leg_index: int = Field(description="航段在确认快照行程中的下标（0 起）")
+    seg_id: int
+    origin: str
+    destination: str
+    start_minute: int = Field(description="该段进入分钟（费率按此分钟选定）")
+    travel_time: int = Field(description="确认时固化的航时（分钟）")
+    rate: int = Field(description="进入分钟命中的费率（分/分钟）；未覆盖分钟为 0")
+    amount: int = Field(description="该段金额：rate × travel_time（整数分）")
+
+
+class BillOut(BaseModel):
+    bill_id: int = Field(description="账单号（自增）")
+    trip_id: int = Field(description="被开单的已确认行程号")
+    rate_version: int = Field(description="开单时所据全局费率版本号")
+    legs: list[BillLegOut] = Field(description="逐段金额明细（开单时固化）")
+    total_amount: int = Field(description="总额（整数分）")
+    billed_at: str = Field(description="开单时间")
+
+
+class BillIssueResponse(BillOut):
+    replayed: bool = Field(
+        description="true=该行程此前已开单，返回原账单（HTTP 200）；首次开单为 false（HTTP 201）",
+    )
+
+
+class ReversalOut(BaseModel):
+    reversal_id: int = Field(description="冲销单号（自增）")
+    bill_id: int = Field(description="被冲销的账单号")
+    trip_id: int = Field(description="被作废的已确认行程号")
+    amount: int = Field(description="等额冲销金额（整数分，与被冲账单总额相同）")
+    reversed_at: str = Field(description="冲销时间（与作废同事务生成）")
+
+
 # ---- 潮位更正后的复核 / 改期 -------------------------------------------------------
 
 class ReviewRequest(BaseModel):
